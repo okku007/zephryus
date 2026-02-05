@@ -9,6 +9,14 @@ An Android app for managing Docker containers on a remote server via SSH.
 - Real-time container status monitoring
 - Secure credential storage using Android Keystore
 
+## How It Works
+
+1. The app establishes an SSH connection to your remote server using your private key
+2. Once connected, it executes Docker commands over the SSH session
+3. Container operations (start/stop/restart) are sent as shell commands
+4. The app queries container status using `docker ps` and displays the results
+5. All credentials and keys are encrypted locally using Android's Keystore system
+
 ## Requirements
 
 - Android 7.0 (API 24) or higher
@@ -41,7 +49,3 @@ An Android app for managing Docker containers on a remote server via SSH.
 ```
 ./gradlew assembleDebug
 ```
-
-## License
-
-MIT
