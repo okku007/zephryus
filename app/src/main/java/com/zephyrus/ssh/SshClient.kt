@@ -1,5 +1,7 @@
 package com.zephyrus.ssh
 
+import android.os.Build
+import androidx.annotation.RequiresApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
@@ -80,6 +82,7 @@ class SshClient {
     /**
      * Execute a command on the remote server.
      */
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     suspend fun executeCommand(command: String): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
             val ssh = client ?: throw IllegalStateException("Not connected")
