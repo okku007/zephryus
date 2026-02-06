@@ -44,6 +44,13 @@ An Android app for managing Docker containers on a remote server via SSH.
 - Koin for dependency injection
 - AndroidX Security for encrypted storage
 
+## Security
+
+- **SSH Host Key Verification** - Protects against man-in-the-middle attacks
+- **Encrypted Credential Storage** - Keys and passphrases stored using AES-256-GCM
+- **Input Validation** - Container names validated to prevent command injection
+- **No Sensitive Logging** - Private keys are never logged or displayed
+
 ## Building
 
 ```
