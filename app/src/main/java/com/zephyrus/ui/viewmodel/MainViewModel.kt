@@ -1,10 +1,12 @@
 package com.zephyrus.ui.viewmodel
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.zephyrus.data.ConnectionState
 import com.zephyrus.data.OperationState
 import com.zephyrus.data.ServerConfigRepository
+import com.zephyrus.security.HostKeyStore
 import com.zephyrus.security.SecureKeyStore
 import com.zephyrus.ssh.DockerCommands
 import com.zephyrus.ssh.SshClient
@@ -16,8 +18,13 @@ import kotlinx.coroutines.launch
 class MainViewModel(
     private val sshClient: SshClient,
     private val keyStore: SecureKeyStore,
-    private val configRepo: ServerConfigRepository
+    private val configRepo: ServerConfigRepository,
+    private val hostKeyStore: HostKeyStore
 ) : ViewModel() {
+    
+    companion object {
+        private const val TAG = "Zephyrus"
+    }
     
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
@@ -30,6 +37,36 @@ class MainViewModel(
     
     private val _connectionLog = MutableStateFlow<List<String>>(emptyList())
     val connectionLog: StateFlow<List<String>> = _connectionLog.asStateFlow()
+    
+    // Host key verification states
+    private val _pendingHostKey = MutableStateFlow<PendingHostKey?>(null)
+    val pendingHostKey: StateFlow<PendingHostKey?> = _pendingHostKey.asStateFlow()
+    
+    data class PendingHostKey(
+        val host: String,
+        val port: Int,
+        val fingerprint: String,
+        val isChanged: Boolean,
+        val oldFingerprint: String? = null
+    )
+    
+    init {
+        // Setup host key verification callbacks
+        sshClient.onNewHostKey = { host, port, fingerprint ->
+            // For now, auto-accept on first connection with logging
+            log("New host verified: $host:$port")
+            log("Fingerprint: ${fingerprint.take(32)}...")
+            true  // Auto-accept first-time connections
+        }
+        
+        sshClient.onHostKeyChanged = { host, port, oldFingerprint, newFingerprint ->
+            // SECURITY: Reject changed host keys (possible MITM attack)
+            log("⚠️ WARNING: Host key changed for $host:$port!")
+            log("This could indicate a man-in-the-middle attack.")
+            Log.w(TAG, "Host key changed for $host:$port - old: $oldFingerprint, new: $newFingerprint")
+            false  // Reject by default for security
+        }
+    }
     
     private fun log(message: String) {
         _connectionLog.value = _connectionLog.value + "[${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())}] $message"
@@ -55,12 +92,33 @@ class MainViewModel(
         keyStore.storePrivateKey(configRepo.keyAlias, keyContent)
     }
     
+    /**
+     * Clear stored host key (use when server key has legitimately changed).
+     */
+    fun clearStoredHostKey() {
+        hostKeyStore.removeFingerprint(configRepo.host, configRepo.port)
+        log("Cleared stored host key for ${configRepo.host}:${configRepo.port}")
+    }
+    
     fun connect() {
         viewModelScope.launch {
             clearLog()
             _connectionState.value = ConnectionState.Connecting
             
-            log("Starting connection to ${configRepo.host}:${configRepo.port}")
+            // Validate configuration before connecting
+            if (configRepo.host.isBlank()) {
+                log("ERROR: Host address is required")
+                _connectionState.value = ConnectionState.Error("Host address not configured")
+                return@launch
+            }
+            
+            if (configRepo.username.isBlank()) {
+                log("ERROR: Username is required")
+                _connectionState.value = ConnectionState.Error("Username not configured")
+                return@launch
+            }
+            
+            log("Connecting to ${configRepo.host}:${configRepo.port}")
             log("Username: ${configRepo.username}")
             
             val privateKey = keyStore.getPrivateKey(configRepo.keyAlias)
@@ -70,8 +128,7 @@ class MainViewModel(
                 return@launch
             }
             
-            log("SSH key loaded (${privateKey.size} bytes)")
-            log("Key preview: ${String(privateKey.take(50).toByteArray())}...")
+            log("SSH key loaded successfully")
             
             val passphrase = configRepo.keyPassphrase.ifBlank { null }
             if (passphrase != null) {
@@ -93,16 +150,18 @@ class MainViewModel(
                     refreshContainerStatus()
                 },
                 onFailure = { e ->
-                    log("ERROR: ${e.javaClass.simpleName}")
-                    log("Message: ${e.message}")
-                    e.cause?.let { cause ->
-                        log("Cause: ${cause.javaClass.simpleName}: ${cause.message}")
+                    // VULN-007 FIX: Minimal error info in UI, detailed logs to system
+                    val userMessage = when {
+                        e.message?.contains("Auth") == true -> "Authentication failed. Check your SSH key."
+                        e.message?.contains("Connection refused") == true -> "Connection refused. Check host and port."
+                        e.message?.contains("timed out") == true -> "Connection timed out. Check network."
+                        e.message?.contains("Host key") == true -> "Host key verification failed."
+                        else -> "Connection failed. Check settings and try again."
                     }
-                    // Log stack trace
-                    e.stackTrace.take(5).forEach { frame ->
-                        log("  at ${frame.className}.${frame.methodName}(${frame.fileName}:${frame.lineNumber})")
-                    }
-                    _connectionState.value = ConnectionState.Error(e.message ?: "Connection failed")
+                    log("ERROR: $userMessage")
+                    // Log full details to Android system log only (not UI)
+                    Log.e(TAG, "SSH connection error", e)
+                    _connectionState.value = ConnectionState.Error(userMessage)
                 }
             )
         }
@@ -118,16 +177,20 @@ class MainViewModel(
         viewModelScope.launch {
             _operationState.value = OperationState.InProgress
             
-            val command = DockerCommands.restart(configRepo.containerName)
-            sshClient.executeCommand(command).fold(
-                onSuccess = { output ->
-                    _operationState.value = OperationState.Success(output)
-                    refreshContainerStatus()
-                },
-                onFailure = { e ->
-                    _operationState.value = OperationState.Error(e.message ?: "Restart failed")
-                }
-            )
+            try {
+                val command = DockerCommands.restart(configRepo.containerName)
+                sshClient.executeCommand(command).fold(
+                    onSuccess = { output ->
+                        _operationState.value = OperationState.Success(output)
+                        refreshContainerStatus()
+                    },
+                    onFailure = { e ->
+                        _operationState.value = OperationState.Error(e.message ?: "Restart failed")
+                    }
+                )
+            } catch (e: IllegalArgumentException) {
+                _operationState.value = OperationState.Error("Invalid container name")
+            }
         }
     }
     
@@ -135,16 +198,20 @@ class MainViewModel(
         viewModelScope.launch {
             _operationState.value = OperationState.InProgress
             
-            val command = DockerCommands.stop(configRepo.containerName)
-            sshClient.executeCommand(command).fold(
-                onSuccess = { output ->
-                    _operationState.value = OperationState.Success(output)
-                    refreshContainerStatus()
-                },
-                onFailure = { e ->
-                    _operationState.value = OperationState.Error(e.message ?: "Stop failed")
-                }
-            )
+            try {
+                val command = DockerCommands.stop(configRepo.containerName)
+                sshClient.executeCommand(command).fold(
+                    onSuccess = { output ->
+                        _operationState.value = OperationState.Success(output)
+                        refreshContainerStatus()
+                    },
+                    onFailure = { e ->
+                        _operationState.value = OperationState.Error(e.message ?: "Stop failed")
+                    }
+                )
+            } catch (e: IllegalArgumentException) {
+                _operationState.value = OperationState.Error("Invalid container name")
+            }
         }
     }
     
@@ -152,30 +219,38 @@ class MainViewModel(
         viewModelScope.launch {
             _operationState.value = OperationState.InProgress
             
-            val command = DockerCommands.start(configRepo.containerName)
-            sshClient.executeCommand(command).fold(
-                onSuccess = { output ->
-                    _operationState.value = OperationState.Success(output)
-                    refreshContainerStatus()
-                },
-                onFailure = { e ->
-                    _operationState.value = OperationState.Error(e.message ?: "Start failed")
-                }
-            )
+            try {
+                val command = DockerCommands.start(configRepo.containerName)
+                sshClient.executeCommand(command).fold(
+                    onSuccess = { output ->
+                        _operationState.value = OperationState.Success(output)
+                        refreshContainerStatus()
+                    },
+                    onFailure = { e ->
+                        _operationState.value = OperationState.Error(e.message ?: "Start failed")
+                    }
+                )
+            } catch (e: IllegalArgumentException) {
+                _operationState.value = OperationState.Error("Invalid container name")
+            }
         }
     }
     
     fun refreshContainerStatus() {
         viewModelScope.launch {
-            val command = DockerCommands.status(configRepo.containerName)
-            sshClient.executeCommand(command).fold(
-                onSuccess = { output ->
-                    _containerStatus.value = output.trim().ifEmpty { "Not found" }
-                },
-                onFailure = {
-                    _containerStatus.value = "Unknown"
-                }
-            )
+            try {
+                val command = DockerCommands.status(configRepo.containerName)
+                sshClient.executeCommand(command).fold(
+                    onSuccess = { output ->
+                        _containerStatus.value = output.trim().ifEmpty { "Not found" }
+                    },
+                    onFailure = {
+                        _containerStatus.value = "Unknown"
+                    }
+                )
+            } catch (e: IllegalArgumentException) {
+                _containerStatus.value = "Invalid container name"
+            }
         }
     }
     

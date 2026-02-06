@@ -2,22 +2,71 @@ package com.zephyrus.ssh
 
 import android.os.Build
 import androidx.annotation.RequiresApi
+import com.zephyrus.security.HostKeyStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.common.IOUtils
+import net.schmizz.sshj.common.SecurityUtils
 import net.schmizz.sshj.connection.channel.direct.Session
-import net.schmizz.sshj.transport.verification.PromiscuousVerifier
+import net.schmizz.sshj.transport.verification.HostKeyVerifier
 import net.schmizz.sshj.userauth.keyprovider.KeyProvider
-import java.io.File
+import java.io.StringReader
+import java.security.PublicKey
 import java.util.concurrent.TimeUnit
 
 /**
  * SSH client wrapper using SSHJ for secure shell connections.
  * Supports OpenSSH private key format, Ed25519, RSA, and ECDSA keys.
+ * 
+ * Security features:
+ * - Host key verification to prevent MITM attacks
+ * - In-memory key loading (no temp files)
  */
-class SshClient {
+class SshClient(private val hostKeyStore: HostKeyStore) {
     private var client: SSHClient? = null
+    
+    // Callback for when a new host is encountered
+    var onNewHostKey: ((host: String, port: Int, fingerprint: String) -> Boolean)? = null
+    
+    // Callback for when host key has changed (possible attack!)
+    var onHostKeyChanged: ((host: String, port: Int, oldFingerprint: String, newFingerprint: String) -> Boolean)? = null
+    
+    /**
+     * Host key verifier that checks against stored fingerprints.
+     */
+    private inner class StoredHostKeyVerifier(
+        private val targetHost: String,
+        private val targetPort: Int
+    ) : HostKeyVerifier {
+        
+        override fun verify(hostname: String, port: Int, key: PublicKey): Boolean {
+            val fingerprint = SecurityUtils.getFingerprint(key)
+            val storedFingerprint = hostKeyStore.getFingerprint(targetHost, targetPort)
+            
+            return when {
+                // First connection - ask user to verify
+                storedFingerprint == null -> {
+                    val accepted = onNewHostKey?.invoke(targetHost, targetPort, fingerprint) ?: false
+                    if (accepted) {
+                        hostKeyStore.storeFingerprint(targetHost, targetPort, fingerprint)
+                    }
+                    accepted
+                }
+                // Fingerprint matches - safe
+                storedFingerprint == fingerprint -> true
+                // Fingerprint changed - possible MITM attack!
+                else -> {
+                    onHostKeyChanged?.invoke(targetHost, targetPort, storedFingerprint, fingerprint) ?: false
+                }
+            }
+        }
+        
+        override fun findExistingAlgorithms(hostname: String, port: Int): MutableList<String> {
+            // Return empty list - we don't restrict algorithms, just verify fingerprints
+            return mutableListOf()
+        }
+    }
     
     /**
      * Connect to an SSH server using private key authentication.
@@ -36,8 +85,8 @@ class SshClient {
             // Create new SSH client
             val ssh = SSHClient()
             
-            // Accept all host keys (for simplicity - in production, implement proper verification)
-            ssh.addHostKeyVerifier(PromiscuousVerifier())
+            // Use secure host key verification (VULN-002 fix)
+            ssh.addHostKeyVerifier(StoredHostKeyVerifier(host, port))
             
             // Set connection timeout
             ssh.connectTimeout = 30_000
@@ -55,25 +104,16 @@ class SshClient {
                 keyString += "\n"
             }
             
-            // Write to temp file
-            val tempKeyFile = File.createTempFile("ssh_key_", null, null)
-            try {
-                tempKeyFile.writeText(keyString, Charsets.UTF_8)
-                
-                // Use SSHClient.loadKeys() which auto-detects key format
-                val keyProvider: KeyProvider = if (passphrase != null && passphrase.isNotEmpty()) {
-                    ssh.loadKeys(tempKeyFile.absolutePath, passphrase)
-                } else {
-                    ssh.loadKeys(tempKeyFile.absolutePath)
-                }
-                
-                // Authenticate with private key
-                ssh.authPublickey(username, keyProvider)
-                
-            } finally {
-                // Clean up temp file
-                tempKeyFile.delete()
+            // VULN-003 FIX: Load key directly from memory using StringReader
+            // instead of writing to temp file
+            val keyProvider: KeyProvider = if (passphrase != null && passphrase.isNotEmpty()) {
+                ssh.loadKeys(keyString, null, net.schmizz.sshj.userauth.password.PasswordUtils.createOneOff(passphrase.toCharArray()))
+            } else {
+                ssh.loadKeys(keyString, null, null)
             }
+            
+            // Authenticate with private key
+            ssh.authPublickey(username, keyProvider)
             
             client = ssh
         }

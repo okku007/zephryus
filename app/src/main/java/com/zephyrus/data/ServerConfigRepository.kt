@@ -2,16 +2,33 @@ package com.zephyrus.data
 
 import android.content.Context
 import androidx.core.content.edit
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 
 /**
  * Repository for server connection configuration.
+ * Sensitive data (passphrase) is stored using encrypted preferences.
  */
 class ServerConfigRepository(context: Context) {
     
+    // Regular preferences for non-sensitive configuration
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     
+    // Encrypted preferences for sensitive data (VULN-004 fix)
+    private val masterKey = MasterKey.Builder(context)
+        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+        .build()
+    
+    private val securePrefs = EncryptedSharedPreferences.create(
+        context,
+        SECURE_PREFS_NAME,
+        masterKey,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
+    
     var host: String
-        get() = prefs.getString(KEY_HOST, DEFAULT_HOST) ?: DEFAULT_HOST
+        get() = prefs.getString(KEY_HOST, "") ?: ""
         set(value) = prefs.edit { putString(KEY_HOST, value) }
     
     var port: Int
@@ -23,16 +40,17 @@ class ServerConfigRepository(context: Context) {
         set(value) = prefs.edit { putString(KEY_USERNAME, value) }
     
     var containerName: String
-        get() = prefs.getString(KEY_CONTAINER, DEFAULT_CONTAINER) ?: DEFAULT_CONTAINER
+        get() = prefs.getString(KEY_CONTAINER, "") ?: ""
         set(value) = prefs.edit { putString(KEY_CONTAINER, value) }
     
     var keyAlias: String
         get() = prefs.getString(KEY_ALIAS, DEFAULT_KEY_ALIAS) ?: DEFAULT_KEY_ALIAS
         set(value) = prefs.edit { putString(KEY_ALIAS, value) }
     
+    // VULN-004 FIX: Passphrase now stored in encrypted preferences
     var keyPassphrase: String
-        get() = prefs.getString(KEY_PASSPHRASE, "") ?: ""
-        set(value) = prefs.edit { putString(KEY_PASSPHRASE, value) }
+        get() = securePrefs.getString(KEY_PASSPHRASE, "") ?: ""
+        set(value) = securePrefs.edit().putString(KEY_PASSPHRASE, value).apply()
     
     fun isConfigured(): Boolean {
         return host.isNotBlank() && username.isNotBlank()
@@ -40,10 +58,12 @@ class ServerConfigRepository(context: Context) {
     
     fun clear() {
         prefs.edit { clear() }
+        securePrefs.edit().clear().apply()
     }
     
     companion object {
         private const val PREFS_NAME = "server_config"
+        private const val SECURE_PREFS_NAME = "server_config_secure"
         private const val KEY_HOST = "host"
         private const val KEY_PORT = "port"
         private const val KEY_USERNAME = "username"
@@ -51,10 +71,8 @@ class ServerConfigRepository(context: Context) {
         private const val KEY_ALIAS = "key_alias"
         private const val KEY_PASSPHRASE = "key_passphrase"
         
-        // Default values for testing
-        private const val DEFAULT_HOST = "192.168.2.102"
+        // VULN-006 FIX: Removed hardcoded default host/container
         private const val DEFAULT_PORT = 22
-        private const val DEFAULT_CONTAINER = "blogsite"
         private const val DEFAULT_KEY_ALIAS = "default"
     }
 }
