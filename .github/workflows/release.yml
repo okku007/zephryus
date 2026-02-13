@@ -71,11 +71,35 @@ jobs:
             exit 1
           fi
           
-          echo "🔍 Verifying APK signature..."
-          $ANDROID_HOME/build-tools/*/apksigner verify --verbose "$APK_PATH"
+          echo "🔍 Verifying APK signature for: $APK_PATH"
           
-          if [ $? -ne 0 ]; then
+          # Try apksigner first (preferred for Android)
+          if command -v apksigner &> /dev/null; then
+            echo "Using apksigner from PATH..."
+            apksigner verify --verbose "$APK_PATH"
+            VERIFY_RESULT=$?
+          elif [ -d "$ANDROID_HOME/build-tools" ]; then
+            echo "Using apksigner from Android SDK..."
+            # Find the latest build-tools version
+            APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" | sort -V | tail -n 1)
+            if [ -n "$APKSIGNER" ]; then
+              "$APKSIGNER" verify --verbose "$APK_PATH"
+              VERIFY_RESULT=$?
+            else
+              echo "apksigner not found in build-tools, using jarsigner..."
+              jarsigner -verify -verbose "$APK_PATH"
+              VERIFY_RESULT=$?
+            fi
+          else
+            # Fallback to jarsigner (available in JDK)
+            echo "Android SDK not found, using jarsigner as fallback..."
+            jarsigner -verify -verbose "$APK_PATH"
+            VERIFY_RESULT=$?
+          fi
+          
+          if [ $VERIFY_RESULT -ne 0 ]; then
             echo "❌ APK signature verification FAILED"
+            echo "APK may be unsigned or incorrectly signed"
             exit 1
           fi
           
