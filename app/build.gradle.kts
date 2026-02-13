@@ -1,7 +1,7 @@
 plugins {
-    alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
-    alias(libs.plugins.kotlin.compose)
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -20,6 +20,16 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            // These will be provided by environment variables in CI
+            storeFile = System.getenv("RELEASE_STORE_FILE")?.let { file(it) }
+            storePassword = System.getenv("RELEASE_STORE_PASSWORD")
+            keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+            keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -27,6 +37,22 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            
+            // SECURITY: Fail fast if signing secrets are missing
+            // This prevents accidentally building unsigned APKs in CI
+            val storeFile = System.getenv("RELEASE_STORE_FILE")
+            val storePassword = System.getenv("RELEASE_STORE_PASSWORD")
+            val keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+            val keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            
+            if (storeFile != null) {
+                // All secrets must be present if any are present
+                require(storePassword != null) { "RELEASE_STORE_PASSWORD not set" }
+                require(keyAlias != null) { "RELEASE_KEY_ALIAS not set" }
+                require(keyPassword != null) { "RELEASE_KEY_PASSWORD not set" }
+                
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
