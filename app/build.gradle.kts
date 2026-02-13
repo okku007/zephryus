@@ -31,8 +31,20 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // Apply signing config if all required env vars are present
-            if (System.getenv("RELEASE_STORE_FILE") != null) {
+            
+            // SECURITY: Fail fast if signing secrets are missing
+            // This prevents accidentally building unsigned APKs in CI
+            val storeFile = System.getenv("RELEASE_STORE_FILE")
+            val storePassword = System.getenv("RELEASE_STORE_PASSWORD")
+            val keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+            val keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            
+            if (storeFile != null) {
+                // All secrets must be present if any are present
+                require(storePassword != null) { "RELEASE_STORE_PASSWORD not set" }
+                require(keyAlias != null) { "RELEASE_KEY_ALIAS not set" }
+                require(keyPassword != null) { "RELEASE_KEY_PASSWORD not set" }
+                
                 signingConfig = signingConfigs.getByName("release")
             }
         }

@@ -5,22 +5,37 @@ on:
     tags:
       - 'v*'
 
+# SECURITY: Prevent concurrent release builds
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# SECURITY: Restrict permissions to minimum required
+permissions:
+  contents: write  # Only for creating releases
+  attestations: write  # For artifact attestation
+  id-token: write  # For OIDC token
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
     
     steps:
+      # SECURITY: Pin to commit SHA instead of mutable tag
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
         with:
           fetch-depth: 0  # Fetch all history for changelog generation
       
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@387ac29b308b003ca37ba93a6cab5eb57c8f5f93  # v4.0.0
         with:
           distribution: 'temurin'
           java-version: '17'
           cache: 'gradle'
+      
+      - name: Validate Gradle wrapper
+        uses: gradle/wrapper-validation-action@699bb18358f12c5b78b37bb0111d3a0e2276e0e2  # v2.1.1
       
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -29,19 +44,59 @@ jobs:
         env:
           RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE }}
         run: |
-          echo "$RELEASE_KEYSTORE" | base64 --decode > release-keystore.jks
+          # SECURITY: Use in-memory tmpfs to minimize disk exposure
+          mkdir -p /dev/shm/secure
+          chmod 700 /dev/shm/secure
+          echo "$RELEASE_KEYSTORE" | base64 --decode > /dev/shm/secure/release-keystore.jks
+          chmod 600 /dev/shm/secure/release-keystore.jks
       
       - name: Build Release APK
         env:
-          RELEASE_STORE_FILE: ../release-keystore.jks
+          # SECURITY: Use hardcoded path to prevent injection via github.workspace
+          RELEASE_STORE_FILE: /dev/shm/secure/release-keystore.jks
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease
+        run: |
+          # SECURITY: Disable daemon, build cache, and scan to prevent leakage
+          ./gradlew assembleRelease --no-daemon --no-build-cache
+      
+      - name: Verify APK signature
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" -type f | head -n 1)
+          
+          # SECURITY: Fail fast if no APK found
+          if [ -z "$APK_PATH" ]; then
+            echo "❌ ERROR: No APK file found in build output!"
+            exit 1
+          fi
+          
+          echo "🔍 Verifying APK signature..."
+          $ANDROID_HOME/build-tools/*/apksigner verify --verbose "$APK_PATH"
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ APK signature verification FAILED"
+            exit 1
+          fi
+          
+          echo "✅ APK is properly signed"
       
       - name: Get tag name
         id: tag_name
-        run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          
+          # SECURITY: Sanitize tag name to prevent injection
+          # Only allow: letters, numbers, dots, hyphens, underscores
+          if ! echo "$TAG" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+            echo "❌ ERROR: Invalid tag name: $TAG"
+            echo "Tag names must match: ^[a-zA-Z0-9._-]+$"
+            exit 1
+          fi
+          
+          # SECURITY: Remove newlines to prevent output injection
+          TAG=$(echo "$TAG" | tr -d '\n\r')
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
       
       - name: Generate changelog
         id: changelog
@@ -56,30 +111,69 @@ jobs:
             CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
           fi
           
-          # Save to file and output
-          echo "$CHANGELOG" > changelog.txt
+          # SECURITY: Sanitize markdown to prevent injection
+          CHANGELOG=$(echo "$CHANGELOG" | sed 's/\[/\\[/g' | sed 's/\]/\\]/g')
+          
+          # SECURITY: Write to secure in-memory location
+          echo "$CHANGELOG" > /dev/shm/secure/changelog.txt
+          chmod 600 /dev/shm/secure/changelog.txt
           echo "Generated changelog from ${PREV_TAG:-initial commit} to HEAD"
       
       - name: Find APK files
         id: find_apk
         run: |
           APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" -type f | head -n 1)
+          
+          # SECURITY: Fail fast if no APK found
+          if [ -z "$APK_PATH" ]; then
+            echo "❌ ERROR: No APK file found!"
+            exit 1
+          fi
+          
+          # SECURITY: Sanitize outputs to prevent injection
+          APK_PATH=$(echo "$APK_PATH" | tr -d '\n\r')
+          APK_NAME=$(basename "$APK_PATH" | tr -d '\n\r')
+          
           echo "APK_PATH=$APK_PATH" >> $GITHUB_OUTPUT
-          echo "APK_NAME=$(basename $APK_PATH)" >> $GITHUB_OUTPUT
+          echo "APK_NAME=$APK_NAME" >> $GITHUB_OUTPUT
+          
+          # Report APK size
+          APK_SIZE=$(du -h "$APK_PATH" | cut -f1)
+          echo "📦 APK Size: $APK_SIZE" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Verify ProGuard mappings exist
+        run: |
+          MAPPING_FILE="app/build/outputs/mapping/release/mapping.txt"
+          if [ ! -f "$MAPPING_FILE" ]; then
+            echo "❌ ERROR: ProGuard mapping file not found!"
+            echo "This is critical for crash report deobfuscation."
+            exit 1
+          fi
+          echo "✅ ProGuard mapping file exists"
+      
+      - name: Upload ProGuard mappings
+        uses: actions/upload-artifact@26f96dfa697d77e81fd5907df203aa23a56210a8  # v4.3.0
+        with:
+          name: proguard-mappings-${{ steps.tag_name.outputs.TAG }}
+          path: app/build/outputs/mapping/release/mapping.txt
+          retention-days: 90
       
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191  # v2.0.1
         with:
           tag_name: ${{ steps.tag_name.outputs.TAG }}
           name: Release ${{ steps.tag_name.outputs.TAG }}
-          body_path: changelog.txt
+          body_path: /dev/shm/secure/changelog.txt
           draft: false
           prerelease: false
-          files: |
-            app/build/outputs/apk/release/*.apk
+          # SECURITY: Upload only the verified APK, not wildcards
+          files: ${{ steps.find_apk.outputs.APK_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Clean up keystore
         if: always()
-        run: rm -f release-keystore.jks
+        run: |
+          # SECURITY: Shred in-memory keystore and remove tmpfs directory
+          shred -vfz -n 3 /dev/shm/secure/release-keystore.jks 2>/dev/null || rm -f /dev/shm/secure/release-keystore.jks
+          rm -rf /dev/shm/secure
